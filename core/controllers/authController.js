@@ -32,7 +32,7 @@ function frontendCallback({ mode, accessToken, error }) {
   const query = new URLSearchParams({ mode }).toString();
   const fragment = accessToken ? `#accessToken=${encodeURIComponent(accessToken)}` : '';
   const errorQuery = error ? `&error=${encodeURIComponent(error)}` : '';
-  return `${process.env.CLIENT_URL ?? 'http://localhost:3000'}/#/oauth/callback?${query}${errorQuery}${fragment}`;
+  return `${process.env.CLIENT_URL ?? 'https://dormhive-frontend.vercel.app'}/#/oauth/callback?${query}${errorQuery}${fragment}`;
 }
 
 function oauthState(provider, mode, role) {

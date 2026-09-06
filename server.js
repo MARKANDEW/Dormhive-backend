@@ -17,7 +17,7 @@ const backendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const uploadsDirectory = path.join(backendDirectory, 'core', 'uploads');
 const serverStartedAt = Date.now();
 const port = Number.parseInt(process.env.PORT ?? '5000', 10);
-const allowedOrigins = (process.env.CLIENT_URL ?? 'http://localhost:3000')
+const allowedOrigins = (process.env.CLIENT_URL ?? 'http://localhost:3000,https://dormhive-frontend.vercel.app')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
