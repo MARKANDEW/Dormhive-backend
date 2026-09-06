@@ -19,7 +19,7 @@ const serverStartedAt = Date.now();
 const port = Number.parseInt(process.env.PORT ?? '5000', 10);
 const allowedOrigins = (process.env.CLIENT_URL ?? 'http://localhost:3000,https://dormhive-frontend.vercel.app')
   .split(',')
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/+$/, ''))
   .filter(Boolean);
 
 const isLocalDevOrigin = (origin = '') => /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/i.test(origin);
