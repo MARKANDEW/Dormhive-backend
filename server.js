@@ -94,7 +94,7 @@ app.get('/api/v1/health', async (_request, response) => {
   const services = {
     api: { status: 'healthy', uptimeSeconds: process.uptime() },
     database,
-    authentication: { status: process.env.JWT_SECRET ? 'healthy' : 'degraded' },
+    authentication: { status: process.env.JWT_ACCESS_SECRET ? 'healthy' : 'degraded' },
     storage,
     notifications: { status: 'healthy' },
     webServer: { status: 'healthy', uptimeSeconds: process.uptime() }
