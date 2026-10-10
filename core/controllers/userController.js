@@ -1,5 +1,7 @@
 import bcrypt from 'bcrypt';
 import * as users from '../models/User.js';
+import * as mediaFiles from '../models/Media.js';
+import { validateUpload } from '../utils/fileValidation.js';
 
 export function validatePasswordChange({ currentPassword, newPassword, confirmPassword }) {
   if (!currentPassword || !newPassword || !confirmPassword) {
@@ -15,6 +17,19 @@ export function validatePasswordChange({ currentPassword, newPassword, confirmPa
     return { valid: false, message: 'New password must be different from your current password.' };
   }
   return { valid: true, message: '' };
+}
+
+export function guardUserStatusChange({ actor, target, nextStatus }) {
+  const requested = String(nextStatus ?? '').toLowerCase();
+  if (actor?.id && target?.id && Number(actor.id) === Number(target.id) && requested === 'suspended') {
+    return { allowed: false, message: 'You cannot suspend your own account.' };
+  }
+
+  if (target?.role === 'admin' && requested === 'suspended') {
+    return { allowed: false, message: 'Administrator accounts cannot be suspended from this panel.' };
+  }
+
+  return { allowed: true, message: '' };
 }
 
 export async function list(request, response, next) {
@@ -43,6 +58,16 @@ export async function update(request, response, next) {
     const isAdmin = request.user.role === 'admin';
     if (request.user.id !== Number(request.params.id) && !isAdmin) return response.status(403).json({ message: 'Permission denied.' });
 
+    const targetUser = await users.findById(request.params.id);
+    if (!targetUser) return response.status(404).json({ message: 'User not found.' });
+
+    const guard = guardUserStatusChange({
+      actor: request.user,
+      target: targetUser,
+      nextStatus: request.body.status
+    });
+    if (!guard.allowed) return response.status(422).json({ message: guard.message });
+
     const hasPasswordChange = ['currentPassword', 'newPassword', 'confirmPassword'].some((key) => Object.prototype.hasOwnProperty.call(request.body, key));
     if (hasPasswordChange) {
       const passwordCheck = validatePasswordChange(request.body);
@@ -65,7 +90,6 @@ export async function update(request, response, next) {
           first_name: request.body.first_name,
           last_name: request.body.last_name,
           phone: request.body.phone,
-          avatar_url: request.body.avatar_url,
           status: request.body.status,
           role: request.body.role
         }
@@ -73,8 +97,7 @@ export async function update(request, response, next) {
           name: request.body.name,
           first_name: request.body.first_name,
           last_name: request.body.last_name,
-          phone: request.body.phone,
-          avatar_url: request.body.avatar_url
+          phone: request.body.phone
         };
     const user = await users.update(request.params.id, input);
     return user ? response.json({ data: user }) : response.status(404).json({ message: 'User not found.' });
@@ -89,8 +112,15 @@ export async function updateAvatar(request, response, next) {
     if (!request.file) {
       return response.status(422).json({ message: 'Please provide a valid image file.' });
     }
-    const roleFolder = request.user?.role || 'tenant';
-    const avatarUrl = `/uploads/users/${roleFolder}/${request.file.filename}`;
+    const file = validateUpload(request.file, { imagesOnly: true });
+    const stored = await mediaFiles.create({
+      uploadedBy: request.user.id,
+      userId: Number(request.params.id),
+      filename: file.filename,
+      mimeType: file.mimeType,
+      buffer: request.file.buffer
+    });
+    const avatarUrl = stored.url;
     const user = await users.update(request.params.id, { avatar_url: avatarUrl });
     return user ? response.json({ data: user }) : response.status(404).json({ message: 'User not found.' });
   } catch (error) { next(error); }

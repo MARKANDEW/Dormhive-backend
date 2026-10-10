@@ -1,17 +1,125 @@
 import bcrypt from 'bcrypt';
+import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
-import { create, findByEmail } from '../models/User.js';
+import {
+  create,
+  createPasswordResetOtpChallenge,
+  createPasswordResetToken,
+  consumePasswordResetToken,
+  findByEmail,
+  findByPhone,
+  getPasswordResetOtpChallenge,
+  incrementPasswordResetOtpAttempt,
+  markPasswordResetOtpVerified,
+  updatePassword
+} from '../models/User.js';
 
 function tokenFor(user) {
   return jwt.sign({ sub: user.id, role: user.role }, process.env.JWT_ACCESS_SECRET, { expiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? '15m' });
 }
 
+const oauthProviders = {
+  google: {
+    clientId: () => process.env.GOOGLE_CLIENT_ID,
+    clientSecret: () => process.env.GOOGLE_CLIENT_SECRET,
+    authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    scope: 'openid email profile'
+  },
+  facebook: {
+    clientId: () => process.env.FACEBOOK_CLIENT_ID,
+    clientSecret: () => process.env.FACEBOOK_CLIENT_SECRET,
+    authorizeUrl: 'https://www.facebook.com/v20.0/dialog/oauth',
+    tokenUrl: 'https://graph.facebook.com/v20.0/oauth/access_token',
+    scope: 'email,public_profile'
+  }
+};
+
+function oauthRedirectUri(provider) {
+  return `${process.env.API_URL ?? `http://localhost:${process.env.PORT ?? 5000}`}/api/v1/auth/${provider}/callback`;
+}
+
+function frontendCallback({ mode, accessToken, error }) {
+  const query = new URLSearchParams({ mode }).toString();
+  const fragment = accessToken ? `#accessToken=${encodeURIComponent(accessToken)}` : '';
+  const errorQuery = error ? `&error=${encodeURIComponent(error)}` : '';
+  return `${process.env.CLIENT_URL ?? 'https://dormhive-frontend.vercel.app'}/#/oauth/callback?${query}${errorQuery}${fragment}`;
+}
+
+function oauthState(provider, mode, role) {
+  return jwt.sign({ provider, mode, role, purpose: 'oauth' }, process.env.JWT_ACCESS_SECRET, { expiresIn: '10m' });
+}
+
+function readOAuthState(value) {
+  const state = jwt.verify(value, process.env.JWT_ACCESS_SECRET);
+  if (state.purpose !== 'oauth' || !oauthProviders[state.provider]) throw new Error('Invalid OAuth state.');
+  return state;
+}
+
+async function exchangeOAuthCode(provider, code) {
+  const config = oauthProviders[provider];
+  const redirectUri = oauthRedirectUri(provider);
+  const tokenParams = new URLSearchParams({ client_id: config.clientId(), client_secret: config.clientSecret(), code, redirect_uri: redirectUri });
+  let tokenResponse;
+  if (provider === 'google') {
+    tokenParams.set('grant_type', 'authorization_code');
+    tokenResponse = await fetch(config.tokenUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: tokenParams });
+  } else {
+    tokenResponse = await fetch(`${config.tokenUrl}?${tokenParams}`);
+  }
+  const tokens = await tokenResponse.json();
+  if (!tokenResponse.ok || !tokens.access_token) throw new Error(tokens.error_description || tokens.error?.message || 'OAuth token exchange failed.');
+  const profileUrl = provider === 'google'
+    ? 'https://openidconnect.googleapis.com/v1/userinfo'
+    : `https://graph.facebook.com/me?fields=id,name,first_name,last_name,email,picture&access_token=${encodeURIComponent(tokens.access_token)}`;
+  const profileResponse = await fetch(profileUrl, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+  const profile = await profileResponse.json();
+  if (!profileResponse.ok || !profile.email) throw new Error('The OAuth provider did not return an email address.');
+  return profile;
+}
+
+export function oauthStart(request, response) {
+  const provider = String(request.params.provider ?? '').toLowerCase();
+  const config = oauthProviders[provider];
+  if (!config) return response.status(404).json({ message: 'Unsupported OAuth provider.' });
+  if (!config.clientId() || !config.clientSecret()) {
+    return response.redirect(frontendCallback({ mode: request.query.mode === 'register' ? 'register' : 'login', error: `${provider} sign-in is not configured on the server.` }));
+  }
+  const mode = request.query.mode === 'register' ? 'register' : 'login';
+  const role = ['tenant', 'owner'].includes(request.query.role) ? request.query.role : 'tenant';
+  const params = new URLSearchParams({ client_id: config.clientId(), redirect_uri: oauthRedirectUri(provider), response_type: 'code', scope: config.scope, state: oauthState(provider, mode, role) });
+  return response.redirect(`${config.authorizeUrl}?${params}`);
+}
+
+export async function oauthCallback(request, response) {
+  const provider = String(request.params.provider ?? '').toLowerCase();
+  const mode = 'login';
+  try {
+    const state = readOAuthState(request.query.state);
+    const profile = await exchangeOAuthCode(provider, request.query.code);
+    let user = await findByEmail(String(profile.email).toLowerCase());
+    if (!user) {
+      const firstName = profile.given_name ?? profile.first_name ?? '';
+      const lastName = profile.family_name ?? profile.last_name ?? '';
+      user = await create({ name: profile.name ?? `${firstName} ${lastName}`.trim(), first_name: firstName, last_name: lastName, email: String(profile.email).toLowerCase(), passwordHash: await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12), phone: null, role: state.role });
+    }
+    if (user.status !== 'active') throw new Error('This account is not active.');
+    return response.redirect(frontendCallback({ mode: state.mode, accessToken: tokenFor(user) }));
+  } catch (error) {
+    return response.redirect(frontendCallback({ mode, error: error.message || 'OAuth sign-in failed.' }));
+  }
+}
+
 export function isValidPhilippinePhoneNumber(value) {
-  if (typeof value !== 'string') return false;
-  const trimValue = value.trim();
-  const digits = trimValue.replace(/\D/g, '');
-  const localNumber = digits.startsWith('63') ? digits.slice(2) : digits;
-  return /^9\d{9}$/.test(localNumber) && localNumber.length === 10;
+  return normalizePhilippinePhoneNumber(value) !== null;
+}
+
+export function normalizePhilippinePhoneNumber(value) {
+  if (typeof value !== 'string' || !/^\+?[\d\s().-]+$/.test(value.trim())) return null;
+  let digits = value.replace(/\D/g, '');
+  if (digits.startsWith('63')) digits = digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('09')) digits = digits.slice(1);
+  return /^9\d{9}$/.test(digits) ? `+63${digits}` : null;
 }
 
 function isValidPhone(value) {
@@ -44,13 +152,122 @@ export async function register(request, response, next) {
   } catch (error) { next(error); }
 }
 
+export function loginRejection(user, passwordMatches) {
+  if (!user || !passwordMatches) return { status: 401, message: 'Invalid email or password.' };
+  if (user.status === 'suspended') {
+    return { status: 403, message: 'Your account has been suspended. Please contact the administrator for assistance.' };
+  }
+  if (user.status !== 'active') return { status: 401, message: 'Invalid email or password.' };
+  return null;
+}
+
 export async function login(request, response, next) {
   try {
     const user = await findByEmail(String(request.body.email ?? '').toLowerCase());
-    if (!user || !(await bcrypt.compare(request.body.password ?? '', user.password_hash)) || user.status !== 'active') return response.status(401).json({ message: 'Invalid email or password.' });
+    const passwordMatches = user ? await bcrypt.compare(request.body.password ?? '', user.password_hash) : false;
+    const rejection = loginRejection(user, passwordMatches);
+    if (rejection) return response.status(rejection.status).json({ message: rejection.message });
     delete user.password_hash;
     response.json({ user, accessToken: tokenFor(user) });
   } catch (error) { next(error); }
 }
 
 export function logout(_request, response) { response.status(204).end(); }
+
+const passwordResetNotice = 'If an active account matches that number, a verification code has been sent.';
+
+function twilioVerifyConfiguration() {
+  const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_VERIFY_SERVICE_SID } = process.env;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_VERIFY_SERVICE_SID) return null;
+  return { accountSid: TWILIO_ACCOUNT_SID, authToken: TWILIO_AUTH_TOKEN, serviceSid: TWILIO_VERIFY_SERVICE_SID };
+}
+
+async function callTwilioVerify(path, values) {
+  const config = twilioVerifyConfiguration();
+  if (!config) {
+    const error = new Error('SMS verification is not configured. Please contact support.');
+    error.statusCode = 503;
+    throw error;
+  }
+  const endpoint = `https://verify.twilio.com/v2/Services/${encodeURIComponent(config.serviceSid)}/${path}`;
+  let result;
+  try {
+    result = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64')}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams(values)
+    });
+  } catch {
+    const error = new Error('SMS verification is temporarily unavailable. Please try again.');
+    error.statusCode = 502;
+    throw error;
+  }
+  const payload = await result.json().catch(() => ({}));
+  if (!result.ok) {
+    const error = new Error('SMS verification is temporarily unavailable. Please try again.');
+    error.statusCode = 502;
+    throw error;
+  }
+  return payload;
+}
+
+export async function requestPasswordResetOtp(request, response, next) {
+  try {
+    const phone = normalizePhilippinePhoneNumber(String(request.body.phone ?? ''));
+    if (!phone) return response.status(422).json({ message: 'Enter a valid Philippine mobile number.' });
+    const user = await findByPhone(phone);
+    if (!user || user.status !== 'active') return response.json({ message: passwordResetNotice, expiresInSeconds: 300, resendAfterSeconds: 60 });
+
+    const currentChallenge = await getPasswordResetOtpChallenge(phone);
+    if (currentChallenge && Number(currentChallenge.resend_in_seconds) > 0) {
+      return response.status(429).json({ message: 'Please wait before requesting another code.', resendAfterSeconds: Number(currentChallenge.resend_in_seconds) });
+    }
+
+    const verification = await callTwilioVerify('Verifications', { To: phone, Channel: 'sms' });
+    await createPasswordResetOtpChallenge({ userId: user.id, phone, verificationSid: verification.sid });
+    response.json({ message: passwordResetNotice, expiresInSeconds: 300, resendAfterSeconds: 60 });
+  } catch (error) { next(error); }
+}
+
+export async function verifyPasswordResetOtp(request, response, next) {
+  try {
+    const phone = normalizePhilippinePhoneNumber(String(request.body.phone ?? ''));
+    const code = String(request.body.code ?? '').trim();
+    if (!phone || !/^\d{6}$/.test(code)) return response.status(422).json({ message: 'Enter a valid mobile number and 6-digit code.' });
+    const challenge = await getPasswordResetOtpChallenge(phone);
+    if (!challenge || Number(challenge.expires_in_seconds) <= 0 || challenge.verified_at) {
+      return response.status(400).json({ message: 'This code is invalid or expired. Request a new code to continue.' });
+    }
+    if (Number(challenge.attempts) >= 5) return response.status(429).json({ message: 'Too many incorrect codes. Request a new code to try again.' });
+    const attempt = await incrementPasswordResetOtpAttempt(phone);
+    if (attempt === null) return response.status(429).json({ message: 'Too many incorrect codes. Request a new code to try again.' });
+
+    const verification = await callTwilioVerify('VerificationCheck', { VerificationSid: challenge.verification_sid, Code: code });
+    if (verification.status !== 'approved') {
+      const attemptsRemaining = Math.max(0, 5 - Number(attempt));
+      return response.status(attemptsRemaining ? 400 : 429).json({
+        message: attemptsRemaining ? `That code is incorrect. ${attemptsRemaining} attempts remaining.` : 'Too many incorrect codes. Request a new code to try again.'
+      });
+    }
+    if (!await markPasswordResetOtpVerified(phone)) {
+      return response.status(400).json({ message: 'This code is invalid or expired. Request a new code to continue.' });
+    }
+    const resetToken = await createPasswordResetToken(challenge.user_id);
+    response.json({ message: 'Mobile number verified.', resetToken, expiresInSeconds: 600 });
+  } catch (error) { next(error); }
+}
+
+export async function resetPassword(request, response, next) {
+  try {
+    const token = String(request.body.token ?? '');
+    const password = String(request.body.password ?? '');
+    if (!token || password.length < 8) return response.status(422).json({ message: 'A valid token and password of at least 8 characters are required.' });
+    const userId = await consumePasswordResetToken(token);
+    if (!userId) return response.status(400).json({ message: 'This reset link is invalid or expired.' });
+    await updatePassword(userId, await bcrypt.hash(password, 12));
+    response.json({ message: 'Password updated successfully. You can now sign in.' });
+  } catch (error) { next(error); }
+}
